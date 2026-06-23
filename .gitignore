@@ -1,0 +1,53 @@
+# Data files
+*.npz
+*.npy
+*.h5
+*.hdf5
+# Large datasets (do NOT commit — multi-GB; GitHub rejects >100MB)
+MPtrj_*.json
+WBM*.json
+*.parquet
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.so
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editor swap files
+*.swp
+*.swo
+*~
+
+# Model checkpoints — large; keep out of git by default
+*.pt
+*.pth
+*.ckpt
+*.mdl
+# ...but DO track small curated example/fixture checkpoints under examples/
+!examples/*.mdl
+
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
+
+# Logs
+*.log
+logs/

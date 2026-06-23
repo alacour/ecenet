@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install (CPU torch + package)
+        run: |
+          python -m pip install --upgrade pip
+          # CPU torch wheel first so we don't pull a CUDA build in CI
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e .[dev]
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Run tests
+        run: |
+          python tests/test_ecenet.py
+          python tests/test_elements.py
+          python tests/test_calculator.py
+          python tests/test_mptrj_trainer.py

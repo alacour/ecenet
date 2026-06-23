@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ecenet"
+version = "0.1.0"
+description = "SO(3)-equivariant interatomic potential (MLIP) using per-edge SO(2) features"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+# Conservative lower bounds — the code runs across Python 3.11 (cluster) and
+# 3.14 (local) with torch 2.10; these floors are safe, not verified minimums.
+# torch is intentionally not pinned to a CUDA-specific build: install the wheel
+# that matches your platform (see https://pytorch.org/get-started/locally/).
+dependencies = [
+    "torch>=2.2",
+    "numpy>=1.24",
+    "ase>=3.22",
+    # sphericart-torch 2.0 dropped the SphericalHarmonics(backward_second_derivatives=...)
+    # kwarg (and made other breaking API changes); pin to the 1.x line we test against.
+    "sphericart-torch>=1.0,<2",
+]
+
+[project.optional-dependencies]
+dev = ["ruff"]
+
+[tool.setuptools.packages.find]
+include = ["ecenet*"]

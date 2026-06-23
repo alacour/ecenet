@@ -1,0 +1,25 @@
+# Ruff config tuned for a scientific / numerics codebase.
+# Baseline PEP 8, but with exceptions where matching the math beats style purity.
+line-length = 110
+
+[lint]
+# E/W: pycodestyle, F: pyflakes (real bugs — unused/undefined names),
+# I: import sorting.
+select = ["E", "F", "W", "I"]
+ignore = [
+    "E741",  # "ambiguous variable name" — l/m/n are quantum numbers here
+    "E226",  # missing whitespace around * — keep dense math like 2*l+1
+    "E221",  # multiple spaces before operator — allow aligned assignment blocks
+    "E222",  # multiple spaces after operator — same
+]
+
+[lint.isort]
+known-first-party = ["ecenet"]
+
+[lint.per-file-ignores]
+# Utility scripts, tests, and profiling tools use a deliberate compact
+# `stmt; stmt` idiom — fine outside the ecenet/ library (which stays strict).
+"scripts/*" = ["E702"]
+"tools/*"   = ["E702"]
+# Tests also import the package after a sys.path.insert (runnable standalone).
+"tests/*"   = ["E702", "E402"]
