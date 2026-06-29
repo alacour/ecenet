@@ -51,3 +51,8 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Local working files (not part of the release)
+ecenet.md
+CHECKPOINT.md
+rmd17/

@@ -110,42 +110,19 @@ class RealSpaceNonlinearity(nn.Module):
     This preserves equivariance because pointwise operations in angular
     space commute with rotation (θ → θ - φ).
 
-    Optionally mixes feature channels at each grid point via an MLP,
-    which is also equivariant since it acts identically at every θ.
-
-    When r_ij_embed_dim or edge_embed_dim > 0, the pre-activation scale and
-    shift become data-dependent: predicted from invariants via a small MLP.
-    This gives each edge its own operating point for the nonlinearity.
-
-    When rms_norm=True, f(θ) is normalized to unit RMS per feature before
-    the activation, keeping the signal in the activation's nonlinear regime
-    regardless of amplitude growth during training. A learnable post_scale
-    rescales the output.
-
     Args:
         n_features: number of feature channels
         m_max: maximum angular frequency
         n_grid: number of θ grid points (default: 4*m_max + 1)
         activation: pointwise nonlinearity ('silu', 'relu', 'tanh', 'gelu')
-        mix_channels: if True, use an MLP that mixes features at each θ point
-        hidden_dim: MLP hidden dimension (only used if mix_channels=True)
-        r_ij_embed_dim: dimension of r_ij embedding (0 to disable)
-        edge_embed_dim: dimension of edge type embedding (0 to disable)
-        rms_norm: if True, normalize f(θ) to unit RMS before activation
     """
 
     def __init__(self, n_features, m_max, n_grid=None, activation='silu',
-                 mix_channels=False, hidden_dim=None,
-                 r_ij_embed_dim=0, edge_embed_dim=0, rms_norm=False,
                  n_types=None):
         super().__init__()
         self.n_features = n_features
         self.m_max = m_max
         self.n_angular = m_max + 1
-        self.mix_channels = mix_channels
-        self.r_ij_embed_dim = r_ij_embed_dim
-        self.edge_embed_dim = edge_embed_dim
-        self.rms_norm = rms_norm
         self.edge_type_nonlin = (n_types is not None)
 
         # Grid size: oversample to reduce aliasing from the nonlinearity.
@@ -174,20 +151,7 @@ class RealSpaceNonlinearity(nn.Module):
 
         # Pre-activation scale and shift
         nonlin_features = n_features
-        cond_dim = r_ij_embed_dim + edge_embed_dim
-        self.data_dependent = cond_dim > 0
-        if self.data_dependent:
-            # Data-dependent: predict per-edge scale and shift from invariants
-            cond_hidden = max(cond_dim, 32)
-            self.cond_net = nn.Sequential(
-                nn.Linear(cond_dim, cond_hidden),
-                nn.SiLU(),
-                nn.Linear(cond_hidden, 2 * n_features),
-            )
-            # Zero-init last layer → scale=1, shift=0 at init
-            nn.init.zeros_(self.cond_net[-1].weight)
-            nn.init.zeros_(self.cond_net[-1].bias)
-        elif self.edge_type_nonlin:
+        if self.edge_type_nonlin:
             # Factorized: scale/shift = src[type_i] + tgt[type_j]; ones/zeros init → identity
             self.pre_scale_src = nn.Parameter(torch.zeros(n_types, nonlin_features, 1))
             self.pre_scale_tgt = nn.Parameter(torch.zeros(n_types, nonlin_features, 1))
@@ -202,32 +166,14 @@ class RealSpaceNonlinearity(nn.Module):
             self.register_buffer('pre_scale', torch.ones(nonlin_features, 1))
             self.register_buffer('pre_shift', torch.zeros(nonlin_features, 1))
 
-        # RMS normalization before activation
-        if self.rms_norm:
-            self.rms_eps = 1e-6
-            self.post_scale = nn.Parameter(torch.ones(n_features, 1))
-
         # Nonlinearity
         act_map = {'silu': nn.SiLU, 'relu': nn.ReLU, 'tanh': nn.Tanh, 'gelu': nn.GELU}
-        if mix_channels:
-            if hidden_dim is None:
-                hidden_dim = n_features
-            self.mlp = nn.Sequential(
-                nn.Linear(n_features, hidden_dim),
-                act_map[activation](),
-                nn.Linear(hidden_dim, n_features),
-            )
-            nn.init.zeros_(self.mlp[-1].bias)
-        else:
-            self.activation = act_map[activation]()
+        self.activation = act_map[activation]()
 
-    def forward(self, A_cos, A_sin, r_ij_embed=None, edge_embed=None,
-                type_i=None, type_j=None):
+    def forward(self, A_cos, A_sin, type_i=None, type_j=None):
         """
         Args:
             A_cos, A_sin: (n_edges, n_features, n_angular)
-            r_ij_embed: (n_edges, r_ij_embed_dim) or None
-            edge_embed: (n_edges, edge_embed_dim) or None
             type_i, type_j: (n_edges,) int tensors of source/target atom types, or None
 
         Returns:
@@ -237,21 +183,7 @@ class RealSpaceNonlinearity(nn.Module):
         f_grid = A_cos @ self.cos_synth + A_sin @ self.sin_synth
 
         # Pre-activation affine transform
-        if self.data_dependent:
-            # Predict per-edge scale and shift from invariants
-            cond_parts = []
-            if self.r_ij_embed_dim > 0 and r_ij_embed is not None:
-                cond_parts.append(r_ij_embed)
-            if self.edge_embed_dim > 0 and edge_embed is not None:
-                cond_parts.append(edge_embed)
-            cond_input = torch.cat(cond_parts, dim=-1)  # (n_edges, cond_dim)
-            cond_out = self.cond_net(cond_input)  # (n_edges, 2 * n_features)
-            scale_delta, shift = cond_out.split(self.n_features, dim=-1)
-            # scale = 1 + delta so it starts near identity
-            scale = (1.0 + scale_delta).unsqueeze(-1)  # (n_edges, n_features, 1)
-            shift = shift.unsqueeze(-1)                 # (n_edges, n_features, 1)
-            f_grid = scale * f_grid + shift
-        elif self.edge_type_nonlin:
+        if self.edge_type_nonlin:
             scale = (self.pre_scale_base
                      + self.pre_scale_src[type_i]
                      + self.pre_scale_tgt[type_j])   # (n_edges, n_features, 1)
@@ -262,24 +194,8 @@ class RealSpaceNonlinearity(nn.Module):
         else:
             f_grid = self.pre_scale * f_grid + self.pre_shift
 
-        # RMS normalization: normalize per-feature to unit RMS across grid
-        if self.rms_norm:
-            rms = torch.sqrt(torch.mean(f_grid ** 2, dim=-1, keepdim=True) + self.rms_eps)
-            f_grid = f_grid / rms
-
         # Apply nonlinearity
-        if self.mix_channels:
-            # Reshape to (n_edges * n_grid, n_features) for channel-mixing MLP
-            shape = f_grid.shape
-            f_flat = f_grid.permute(0, 2, 1).reshape(-1, self.n_features)
-            f_flat = self.mlp(f_flat)
-            f_grid = f_flat.reshape(shape[0], self.n_grid, self.n_features).permute(0, 2, 1)
-        else:
-            f_grid = self.activation(f_grid)
-
-        # Rescale after activation
-        if self.rms_norm:
-            f_grid = self.post_scale * f_grid
+        f_grid = self.activation(f_grid)
 
         # Analysis: grid values → Fourier coefficients
         A_cos_out = f_grid @ self.cos_analysis
