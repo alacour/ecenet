@@ -18,6 +18,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from ecenet.equivariant_linear_kernel import EquivariantLinearTriton, el_triton_ok
 from ecenet.realspace_kernel import RealSpaceFused, is_fusible
 
 
@@ -47,6 +48,12 @@ class EquivariantLinear(nn.Module):
     so dispatch is automatic: dense for CUDA fp16/bf16, and for CUDA fp32
     with TF32 enabled; einsum otherwise. ``dense_gemm`` (True/False)
     overrides the automatic choice.
+
+    Triton path (``equivariant_linear_kernel``): on CUDA fp32 with Triton
+    importable, a per-mode tensor-core dot reads the interleaved layout
+    directly — no copies (einsum) and no zero-block padding (dense). It is
+    the first choice there; ``triton_gemm`` (True/False) overrides, and
+    ``ECENET_EL_TRITON=0`` disables it process-wide for A/B timing.
     """
 
     def __init__(self, in_features, out_features, n_angular, m_max):
@@ -56,6 +63,7 @@ class EquivariantLinear(nn.Module):
         self.n_angular = n_angular
         self.m_max = m_max
         self.dense_gemm = None       # None = auto (see _use_dense)
+        self.triton_gemm = None      # None = auto (see _use_triton)
 
         # (n_angular, out_features, in_features)
         std = (2.0 / (in_features + out_features)) ** 0.5
@@ -73,6 +81,11 @@ class EquivariantLinear(nn.Module):
         return (x.dtype == torch.float32
                 and torch.backends.cuda.matmul.allow_tf32)
 
+    def _use_triton(self, x):
+        if self.triton_gemm is not None:
+            return self.triton_gemm
+        return el_triton_ok(x)
+
     def _dense_weight(self):
         """(in·n_ang, out·n_ang) block-diagonal-per-m weight, row-major flat
         index c = feature·n_ang + m on both sides."""
@@ -83,6 +96,8 @@ class EquivariantLinear(nn.Module):
         return Wd.reshape(Fi * na, Fo * na)
 
     def forward(self, A_cos, A_sin):
+        if self._use_triton(A_cos):
+            return EquivariantLinearTriton.apply(A_cos, A_sin, self.weights, self.bias)
         if not self._use_dense(A_cos):
             A_cos_out = torch.einsum('...id,doi->...od', A_cos, self.weights)
             A_sin_out = torch.einsum('...id,doi->...od', A_sin, self.weights)

@@ -62,6 +62,10 @@ class ECENetCalculator(Calculator):
         super().__init__(**kwargs)
         self.model = model
         self.model.eval()
+        # Inference only: parameters never need gradients here, and freezing
+        # them lets custom autograd Functions (the Triton EquivariantLinear)
+        # skip their weight-gradient kernels in autograd.grad(E, pos).
+        self.model.requires_grad_(False)
         # Ensure the analytic ACE basis is used (no SH in the backward graph).
         self.model.analytic_ace_basis = True
         self.dtype  = dtype
@@ -353,8 +357,7 @@ class ECENetCalculator(Calculator):
         # a cell relaxed/expanded past dissociation) has a position- and
         # strain-independent energy (Σ atomic offsets), so the leaves never
         # enter the graph; the physical gradient is exactly zero there.
-        grads = torch.autograd.grad(energy_tensor, [pos_s, strain],
-                                    allow_unused=True)
+        grads = self._grad_or_none(energy_tensor, [pos_s, strain])
         f = -grads[0] if grads[0] is not None else torch.zeros_like(pos_s)
         s = grads[1] if grads[1] is not None else torch.zeros_like(strain)
         return energy_tensor, f, s
@@ -422,11 +425,20 @@ class ECENetCalculator(Calculator):
             energy_tensor = self._energy_pbc(
                 pos, types, edge_i, edge_j, shift_vecs_edge,
                 nb_src, nb_dst, shift_vecs_nb, cell=cell_t)
-            g = torch.autograd.grad(energy_tensor, pos, allow_unused=True)[0]
+            g = self._grad_or_none(energy_tensor, [pos])[0]
             forces_tensor = -g if g is not None else torch.zeros_like(pos)
             stress_grad   = None
 
         return energy_tensor, forces_tensor, stress_grad, len(edge_i), t_nl
+
+    @staticmethod
+    def _grad_or_none(energy, inputs):
+        """``autograd.grad`` tolerant of a position-independent energy (zero-edge
+        systems: dissociated fragments). With parameters frozen such an energy
+        has no graph at all, so ``allow_unused`` alone would still raise."""
+        if not energy.requires_grad:
+            return [None] * len(inputs)
+        return torch.autograd.grad(energy, inputs, allow_unused=True)
 
     def calculate(self, atoms=None, properties=('energy', 'forces'),
                   system_changes=all_changes):
@@ -452,8 +464,7 @@ class ECENetCalculator(Calculator):
                 energy_tensor = self._energy_free(pos, types)
                 # allow_unused: zero-edge systems (dissociated fragments)
                 # have a position-independent energy; forces are exactly 0.
-                g = torch.autograd.grad(energy_tensor, pos,
-                                        allow_unused=True)[0]
+                g = self._grad_or_none(energy_tensor, [pos])[0]
                 forces_tensor = -g if g is not None else torch.zeros_like(pos)
                 stress_grad   = None
 
