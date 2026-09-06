@@ -84,7 +84,7 @@ class EquivariantLinear(nn.Module):
     def _use_triton(self, x):
         if self.triton_gemm is not None:
             return self.triton_gemm
-        return el_triton_ok(x)
+        return el_triton_ok(x, self.n_angular)
 
     def _dense_weight(self):
         """(in·n_ang, out·n_ang) block-diagonal-per-m weight, row-major flat

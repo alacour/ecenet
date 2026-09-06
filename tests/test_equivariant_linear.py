@@ -254,8 +254,9 @@ def test_triton_dispatch():
     lin.triton_gemm = None
     if _triton_available():
         xc = x.cuda()
-        assert lin._use_triton(xc) == el_triton_ok(xc)
-        assert el_triton_ok(xc) and not el_triton_ok(xc.double())
+        assert lin._use_triton(xc) == el_triton_ok(xc, 3)
+        assert el_triton_ok(xc, 3) and not el_triton_ok(xc.double(), 3)
+        assert not el_triton_ok(xc, 5), "n_ang > 4 must fall back (no register split)"
         print("  triton dispatch: auto on CUDA fp32, off on CPU/fp64, override works")
     else:
         print("  triton dispatch: off on CPU, override works (CUDA cases skipped)")
