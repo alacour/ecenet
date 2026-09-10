@@ -126,6 +126,7 @@ def train_ecenet_xyz(
     les_charge_scale=1.0,    # fixed multiplier on the edge-mode latent charge (MACELES: 0.1)
     les_dipole=False,        # edge head also emits bond dipoles; l0 packed [q | u]
     les_charges=True,        # False (needs les_dipole): dipoles-only — q hard zero, standard-init dipole head
+    les_alpha=None,          # None | 'iso' | 'aniso': edge head also emits polarizabilities (induced dipoles)
     # Geometry
     r_cut_edge=5.0,
     r_cut_neighbor=4.0,
@@ -295,6 +296,7 @@ def train_ecenet_xyz(
         les_charge_scale=les_charge_scale,
         les_dipole=les_dipole,
         les_charges=les_charges,
+        les_alpha=les_alpha,
     )
     if dtype == torch.float64:
         model = model.double()
@@ -419,6 +421,7 @@ def train_ecenet_xyz(
                 les_charge_scale=les_charge_scale,
                 les_dipole=les_dipole,
                 les_charges=les_charges,
+                les_alpha=les_alpha,
             ),
             'element_to_type': elements.to_element_to_type(type_map),
             'e_ref': e_ref,

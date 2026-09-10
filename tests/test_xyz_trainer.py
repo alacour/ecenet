@@ -420,6 +420,154 @@ def test_les_calculator():
           f"FD {d_bec:.1e}; isolated path {dfree:.1e}; SR refused\n")
 
 
+def test_les_calculator_alpha():
+    """les_alpha end to end: an xyz-trained 'aniso' checkpoint loads through
+    load_calculator; α moved off its zero init; energy/forces equal the
+    manual joint graph with the induced-dipole term; stress FD holds through
+    the periodic α path; results['les_alphas'] is the unpacked l0 slot;
+    compute_polarizability is the symmetric sum Σα_i (isolated and periodic)
+    and equals dP/dE_ext via upstream's e_ext; compute_bec is finite and
+    differs from the α-less Z*; an SR/α-less checkpoint refuses it."""
+    if not _has_les():
+        print("=== SKIP: LES α calculator (optional `les` package not installed) ===\n")
+        return
+    print("=== ECENetLESCalculator + les_alpha: forces, stress FD, α, BEC ===")
+    from ase import Atoms
+
+    from ecenet.calculator import load_calculator
+    from ecenet.les import total_polarizability, unpack_l0
+
+    with tempfile.TemporaryDirectory() as td:
+        ckpt = os.path.join(td, 'les_alpha.mdl')
+        train_ecenet_xyz(
+            train_structures=make_structures(8, seed=21), n_val=2,
+            use_les=True, les_readout='edge_basis', les_dipole=True,
+            les_alpha='aniso', checkpoint_path=ckpt, n_epochs=2,
+            batch_size=4, lr=5e-3, **COMMON)
+        calc = load_calculator(ckpt, device='cpu', verbose=False)
+        assert calc.les_flags['les_alpha'] == 'aniso'
+        flags = calc.les_flags
+
+        s = make_structures(1, seed=22, box=(8.5, 9.0))[0]
+        atoms = Atoms(numbers=s['numbers'], positions=s['positions'],
+                      cell=s['cell'], pbc=True)
+        atoms.calc = calc
+        e_calc = atoms.get_potential_energy()
+        f_calc = atoms.get_forces()
+        na = len(atoms)
+
+        # manual joint graph with the same weights/topology
+        types = torch.tensor(
+            [calc.element_to_type[sym] for sym in atoms.get_chemical_symbols()],
+            dtype=torch.long)
+        pos = torch.tensor(s['positions'], dtype=DTYPE).requires_grad_(True)
+        ei, ej, she = calc._gpu_neighbor_list(pos.detach(), s['cell'],
+                                              calc.model.r_cut_edge)
+        ni, nj, shn = calc._gpu_neighbor_list(pos.detach(), s['cell'],
+                                              calc.model.r_cut_neighbor)
+        e_sr, l0 = calc.model.forward_pbc(pos, types, ei, ej, she, ni, nj, shn,
+                                          return_embeddings=True, l0_only=True)
+        cell_t = torch.tensor(s['cell'], dtype=DTYPE)
+        e_man = e_sr + calc.les_module(l0, pos, cell=cell_t, **flags).sum()
+        f_man = -torch.autograd.grad(e_man, pos)[0].numpy()
+        e_ref_sum = sum(calc.energy_reference[sym]
+                        for sym in atoms.get_chemical_symbols())
+        de = abs(e_calc - (e_man.item() + e_ref_sum))
+        df = np.abs(f_calc - f_man).max()
+        assert de < 1e-10 and df < 1e-10, f"joint graph: dE={de:.1e} dF={df:.1e}"
+
+        # α trained off its zero init, and it changes E_lr
+        q_l, u_l, a_l = unpack_l0(l0.detach(), **flags)
+        assert a_l.shape == (na, 3, 3) and a_l.abs().max() > 0, "α stayed 0"
+        l0_noa = l0.detach()[:, :4]
+        e_lr_a = calc.les_module(l0.detach(), pos.detach(), cell=cell_t,
+                                 **flags).sum()
+        e_lr_0 = calc.les_module(l0_noa, pos.detach(), cell=cell_t,
+                                 l0_is_charge=True, les_dipole=True).sum()
+        assert abs(float(e_lr_a - e_lr_0)) > 0, "α term contributes nothing"
+
+        # stash: α slot exposed on every force call
+        da = np.abs(calc.results['les_alphas'] - a_l.numpy()).max()
+        du = np.abs(calc.results['les_dipoles'] - u_l.numpy()).max()
+        assert da < 1e-12 and du < 1e-12, f"stash: dα={da:.1e} du={du:.1e}"
+
+        # stress FD through the periodic α path (one normal, one shear)
+        stress_v = atoms.get_stress()
+        V = abs(np.linalg.det(s['cell']))
+        eps = 1e-6
+        max_err = 0.0
+        for (a, b), vi in [((1, 1), 1), ((0, 2), 4)]:
+            E = np.zeros((3, 3)); E[a, b] = eps
+            es = []
+            for sign in (+1, -1):
+                F = np.eye(3) + sign * E
+                at = Atoms(numbers=s['numbers'], positions=s['positions'] @ F,
+                           cell=s['cell'] @ F, pbc=True)
+                at.calc = calc
+                es.append(at.get_potential_energy())
+            fd = (es[0] - es[1]) / (2 * eps) / V
+            max_err = max(max_err, abs(fd - stress_v[vi]))
+        assert max_err < 1e-7, f"stress FD with α: {max_err:.2e}"
+
+        # polarizability: Σα_i, symmetric, same on the isolated path, and
+        # equal to dP/dE_ext through upstream (the induced dipoles' response
+        # to a uniform external field IS Σα for this non-self-consistent model)
+        P = calc.compute_polarizability(atoms)
+        assert P.shape == (3, 3)
+        dP = np.abs(P - total_polarizability(a_l)[0].numpy()).max()
+        assert dP < 1e-12 and np.abs(P - P.T).max() < 1e-12
+        atoms_free = Atoms(numbers=s['numbers'], positions=s['positions'])
+        atoms_free.calc = calc
+        P_free = calc.compute_polarizability(atoms_free)
+        pos_f = torch.tensor(s['positions'], dtype=DTYPE)
+        with torch.no_grad():
+            _, l0_f = calc.model(pos_f, types, return_embeddings=True,
+                                 l0_only=True)
+        _, _, a_f = unpack_l0(l0_f, **flags)
+        dPf = np.abs(P_free - a_f.sum(0).numpy()).max()
+        assert dPf < 1e-12, f"isolated polarizability: {dPf:.1e}"
+        e_ext = torch.zeros(3, dtype=DTYPE, requires_grad=True)
+        q_f, u_f, _ = unpack_l0(l0_f, **flags)
+        res = calc.les_module.les(latent_charges=q_f, latent_dipoles=u_f,
+                                  latent_alphas=a_f, positions=pos_f,
+                                  cell=None, e_ext=e_ext, compute_energy=True)
+        P_tot = res['latent_dipoles'].reshape(-1, 3).sum(0)     # Σ(u + Δu)
+        dPdE = torch.stack([torch.autograd.grad(P_tot[c], e_ext,
+                                                retain_graph=True)[0]
+                            for c in range(3)]).numpy()
+        dE = np.abs(dPdE - P_free).max()
+        assert dE < 1e-10, f"Σα != dP/dE_ext: {dE:.1e}"
+
+        # BEC with the induced dipoles: finite, periodic and isolated, and
+        # not the α-less tensor
+        Z = calc.compute_bec(atoms)
+        Z_free = calc.compute_bec(atoms_free)
+        assert Z.shape == (na, 3, 3) and np.isfinite(Z).all()
+        assert Z_free.shape == (na, 3, 3) and np.isfinite(Z_free).all()
+        pos_g = torch.tensor(s['positions'], dtype=DTYPE, requires_grad=True)
+        _, l0_g = calc.model(pos_g, types, return_embeddings=True, l0_only=True)
+        Z_noa = calc.les_module.born_charges(l0_g[:, :4], pos_g, cell=None,
+                                             l0_is_charge=True, les_dipole=True)
+        dz = np.abs(Z_free - Z_noa.detach().numpy()).max()
+        assert dz > 1e-9, "induced dipoles missing from Z*"
+
+        # an α-less checkpoint refuses compute_polarizability
+        ckpt0 = os.path.join(td, 'les_noalpha.mdl')
+        train_ecenet_xyz(
+            train_structures=make_structures(6, seed=23), n_val=2,
+            use_les=True, les_readout='edge_basis', checkpoint_path=ckpt0,
+            n_epochs=1, batch_size=4, lr=5e-3, **COMMON)
+        calc0 = load_calculator(ckpt0, device='cpu', verbose=False)
+        try:
+            calc0.compute_polarizability(atoms_free)
+            raise AssertionError("α-less checkpoint should refuse")
+        except ValueError as e:
+            assert 'les_alpha' in str(e)
+    print(f"  joint graph (dE={de:.1e}, dF={df:.1e}); stress FD {max_err:.1e}; "
+          f"α stashed ({da:.1e}); Σα == dP/dE_ext ({dE:.1e}); BEC finite, "
+          f"induced part {dz:.1e}; α-less refused\n")
+
+
 def test_tensorize_keeps_cell():
     print("=== tensorize: cell kept for periodic, None otherwise ===")
     structs = make_structures(2, seed=5)
@@ -441,4 +589,5 @@ if __name__ == '__main__':
     test_smoke_train_les()
     test_calculator_rejects_les_checkpoint()
     test_les_calculator()
+    test_les_calculator_alpha()
     print("ALL TESTS PASSED")

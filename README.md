@@ -167,8 +167,10 @@ model, les_module, results = train_ecenet_xyz(
 
 The latent charge comes from a per-edge charge head mirroring the energy
 readout (`les_readout='edge_basis'`, the default with `use_les=True`);
-alternative read-outs and the related options — latent dipoles, charge
-scaling, dipoles-only — are documented in the model docstring.
+alternative read-outs and the related options — latent dipoles
+(`les_dipole`), latent polarizabilities (`les_alpha='iso'|'aniso'`, the
+induced-dipole term of the polarizable-multipole LES), charge scaling,
+dipoles-only — are documented in the model docstring.
 
 **MD and evaluation.** `ECENetLESCalculator` loads a joint checkpoint and
 evaluates `E = E_sr + E_lr` on one graph — forces from the joint backward,
@@ -185,8 +187,12 @@ print(atoms.get_potential_energy())   # E_sr + E_lr, eV
 ```
 
 Every force call also exposes the latent charges via `atoms.get_charges()`
-(and dipoles as `calc.results['les_dipoles']`); `calc.compute_bec(atoms)`
-returns Born effective charges `Z* = ∂P/∂r` with charge-flow terms included.
+(and dipoles / polarizabilities as `calc.results['les_dipoles']` /
+`calc.results['les_alphas']`); `calc.compute_bec(atoms)` returns Born
+effective charges `Z* = ∂P/∂r` with charge-flow terms included, and for a
+`les_alpha` checkpoint `calc.compute_polarizability(atoms)` returns the
+molecular polarizability tensor `Σᵢ αᵢ` (latent units; physical for isolated
+molecules, bulk needs the ε∞ unscaling of the LES paper).
 `run_md_xyz --dump_charges` / `--dump_bec` write them onto every dumped frame
 as extxyz columns (`les_q`, `les_u`, `bec`), giving charge/dipole/BEC
 trajectories along MD. The global sign of the latent charges is arbitrary

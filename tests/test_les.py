@@ -11,6 +11,10 @@ Wrapper-side: without the upstream ``les`` package, ``import ecenet.les`` still
 works and constructing `LESLongRange` raises an ImportError carrying the
 install hint; with it installed, a smoke forward returns a finite energy.
 
+With les_alpha ('iso'/'aniso'): the packed [q | u | α] layout, α's
+equivariance and uniaxial single-bond form, and the wrapper's induced-dipole
+energy against upstream's loop and finite differences.
+
 Run:  python tests/test_les.py
 """
 
@@ -497,6 +501,241 @@ def test_edge_dipole_les_energy():
           f"({dc:.1e}); flag misuse rejected")
 
 
+def test_edge_alpha():
+    """les_alpha: l0 packed [q | u | α]; α exactly 0 at init (zero-init
+    slots); 'iso' an invariant scalar, 'aniso' a symmetric rank-2 tensor
+    transforming as α' = RαRᵀ; a lone bond gives a uniaxial tensor with r̂
+    as principal axis (the diatomic α_∥/α_⊥); les_charge_scale scales [q | u]
+    but not α; batched variants consistent; non-edge read-outs rejected."""
+    from ecenet.les import total_polarizability, unpack_l0
+    for mode in ('edge', 'edge_basis'):
+        for kind, width in (('iso', 1), ('aniso', 9)):
+            m = make_model(seed=0, les_readout=mode, les_dipole=True,
+                           les_alpha=kind)
+            pos, types = random_structure()
+            _, l0 = m(pos, types, return_embeddings=True, l0_only=True)
+            assert l0.shape == (len(types), 4 + width), \
+                f"{mode}/{kind}: {tuple(l0.shape)}"
+            assert l0[:, 4:].abs().max() == 0.0, f"{mode}/{kind}: α≠0 at init"
+            assert l0[:, 0].abs().max() > 0, f"{mode}/{kind}: q=0 at init"
+
+            # perturb the zero-init α slots, then check SO(3) behaviour
+            with torch.no_grad():
+                if mode == 'edge':
+                    m.les_edge_charge.weight[2:].normal_(std=0.5)
+                else:
+                    last = m.les_edge_charge.linears[-1]
+                    last.weight[2 * m.n_max_d:].normal_(std=0.5)
+            Q = rand_rotation()
+            _, l0a = m(pos, types, return_embeddings=True, l0_only=True)
+            _, l0b = m(pos @ Q.T, types, return_embeddings=True, l0_only=True)
+            qa, ua, aa = unpack_l0(l0a, **m.les_flags)
+            qb, ub, ab = unpack_l0(l0b, **m.les_flags)
+            assert aa.abs().max() > 0, f"{mode}/{kind}: α still 0"
+            dq = (qa - qb).abs().max()
+            du = (ua @ Q.T - ub).abs().max()
+            if kind == 'iso':
+                assert aa.shape == (len(types),)
+                da = (aa - ab).abs().max()
+            else:
+                assert aa.shape == (len(types), 3, 3)
+                sym = (aa - aa.transpose(1, 2)).abs().max()
+                assert sym == 0.0, f"{mode}: α not symmetric: {sym:.3e}"
+                da = (Q @ aa @ Q.T - ab).abs().max()
+            assert dq < TOL and du < TOL, f"{mode}/{kind}: q/u broke"
+            assert da < TOL, f"{mode}/{kind}: α not equivariant: {da:.3e}"
+            P = total_polarizability(aa)
+            assert P.shape == (1, 3, 3)
+            print(f"  {mode}+α({kind}): packed (N,{4 + width}), α=0 at init, "
+                  f"equivariant ({da:.1e})")
+
+    # a single bond: α_i = a·I + b·(r̂r̂ᵀ − I/3) is uniaxial about r̂ — r̂ is
+    # an eigenvector and the two perpendicular eigenvalues coincide
+    m = make_model(seed=0, les_readout='edge_basis', les_dipole=False,
+                   les_alpha='aniso')
+    with torch.no_grad():
+        m.les_edge_charge.linears[-1].weight[m.n_max_d:].normal_(std=0.5)
+    pos2 = torch.tensor([[0.0, 0.0, 0.0], [0.7, 0.9, -0.5]], dtype=DTYPE)
+    types2 = torch.tensor([0, 1])
+    _, l0 = m(pos2, types2, return_embeddings=True, l0_only=True)
+    _, _, a2 = unpack_l0(l0, **m.les_flags)
+    r_hat = pos2[1] - pos2[0]
+    r_hat = r_hat / r_hat.norm()
+    for i in range(2):
+        A = a2[i]
+        lam = r_hat @ A @ r_hat
+        d_axis = (A @ r_hat - lam * r_hat).abs().max()
+        assert d_axis < TOL, f"atom {i}: r̂ not an eigenvector ({d_axis:.1e})"
+        evals = torch.linalg.eigvalsh(A)
+        # two of the three eigenvalues coincide (perpendicular pair)
+        gaps = sorted([(evals[1] - evals[0]).abs(), (evals[2] - evals[1]).abs()])
+        assert gaps[0] < 1e-9, f"atom {i}: not uniaxial: {evals.tolist()}"
+    assert (a2[0] - a2[0].trace() / 3 * torch.eye(3, dtype=DTYPE)).abs().max() > 0, \
+        "traceless part vanished"
+    print("  lone bond → uniaxial α with r̂ as principal axis")
+
+    # les_charge_scale scales [q | u], leaves α alone
+    ms = make_model(seed=0, les_readout='edge_basis', les_dipole=True,
+                    les_alpha='iso', les_charge_scale=0.1)
+    m1 = make_model(seed=0, les_readout='edge_basis', les_dipole=True,
+                    les_alpha='iso', les_charge_scale=1.0)
+    for mm in (ms, m1):
+        with torch.no_grad():
+            mm.les_edge_charge.linears[-1].weight[2 * mm.n_max_d:].normal_(
+                std=0.5, generator=torch.Generator().manual_seed(4))
+            mm.les_edge_charge.linears[-1].weight[mm.n_max_d:2 * mm.n_max_d]\
+                .normal_(std=0.5, generator=torch.Generator().manual_seed(5))
+    pos, types = random_structure()
+    _, l0s = ms(pos, types, return_embeddings=True, l0_only=True)
+    _, l01 = m1(pos, types, return_embeddings=True, l0_only=True)
+    dqu = (l0s[:, :4] - 0.1 * l01[:, :4]).abs().max()
+    dal = (l0s[:, 4:] - l01[:, 4:]).abs().max()
+    assert dqu < TOL and dal < TOL, f"scale: dqu={dqu:.1e}, dα={dal:.1e}"
+    print("  les_charge_scale: [q | u] scaled, α untouched")
+
+    # batched slicing of the packed l0 matches per-structure forwards
+    structs = [random_structure(5, seed=1), random_structure(7, seed=3)]
+    m = make_model(seed=0, les_readout='edge_basis', les_dipole=True,
+                   les_alpha='aniso')
+    with torch.no_grad():
+        m.les_edge_charge.linears[-1].weight[m.n_max_d:].normal_(std=0.5)
+    _, l0_list = m.forward_batch_multi([p for p, _ in structs],
+                                       [t for _, t in structs],
+                                       return_embeddings=True, l0_only=True)
+    for b, (pos_b, types_b) in enumerate(structs):
+        _, l0_ref = m(pos_b, types_b, return_embeddings=True, l0_only=True)
+        dl = (l0_list[b] - l0_ref).abs().max()
+        assert dl < TOL, f"structure {b}: dl0={dl:.3e}"
+
+    for bad in (dict(les_readout='sum', les_alpha='iso'),
+                dict(les_readout='edge_basis', les_alpha='full')):
+        try:
+            ECENet(**COMMON, **bad)
+            raise AssertionError(f"{bad} should have raised")
+        except ValueError as e:
+            assert 'les_alpha' in str(e)
+    print("  α read-out: batched variants consistent; bad configs rejected")
+
+
+def test_edge_alpha_les_energy():
+    """Wrapper with les_alpha: the vectorized isolated path (field of the
+    fixed multipoles from the masked f_qu/f_uu kernels, then −½E·α·E) equals
+    upstream's per-structure loop in energies and position gradients for
+    'iso'/'aniso' with and without dipoles; forces pass a finite-difference
+    check independent of upstream; α=0 reduces exactly to the no-α energy;
+    the periodic path passes α through; born_charges with α goes through
+    upstream's induced dipoles; flag misuse is rejected."""
+    if not HAVE_LES:
+        print("  skipped (`les` not installed)")
+        return
+    from ecenet.les import total_polarizability
+    lr = LESLongRange().double()
+    g = torch.Generator().manual_seed(12)
+    sizes = [4, 6]
+    N = sum(sizes)
+    pos = torch.randn(N, 3, generator=g, dtype=DTYPE) * 2.0
+    q = torch.randn(N, generator=g, dtype=DTYPE) * 0.3
+    u = torch.randn(N, 3, generator=g, dtype=DTYPE) * 0.2
+    a_iso = torch.rand(N, generator=g, dtype=DTYPE) * 0.5
+    S = torch.randn(N, 3, 3, generator=g, dtype=DTYPE)
+    a_ani = 0.3 * (S @ S.transpose(1, 2))          # symmetric positive
+    batch = torch.cat([torch.full((n,), b, dtype=torch.long)
+                       for b, n in enumerate(sizes)])
+
+    worst = 0.0
+    for dip in (False, True):
+        for kind, alpha in (('iso', a_iso), ('aniso', a_ani)):
+            cols = [q[:, None]] + ([u] if dip else []) + [alpha.reshape(N, -1)]
+            packed = torch.cat(cols, dim=1)
+            p_a = pos.clone().requires_grad_(True)
+            e = lr(packed, p_a, batch=batch, n_struct=2, l0_is_charge=True,
+                   les_dipole=dip, les_alpha=kind)
+            f_a = torch.autograd.grad(e.sum(), p_a)[0]
+            p_b = pos.clone().requires_grad_(True)
+            res = lr.les(latent_charges=q, latent_dipoles=u if dip else None,
+                         latent_alphas=alpha, positions=p_b, cell=None,
+                         batch=batch, compute_energy=True)
+            f_b = torch.autograd.grad(res['E_lr'].sum(), p_b)[0]
+            de = (e - res['E_lr'].reshape(e.shape)).abs().max()
+            df = (f_a - f_b).abs().max()
+            assert de < 1e-10 and df < 1e-10, \
+                f"{kind}/dip={dip}: != upstream loop: dE={de:.3e}, dF={df:.3e}"
+            worst = max(worst, float(de), float(df))
+            # α=0 reduces to the no-α energy; α≠0 changes it
+            cols0 = cols[:-1] + [torch.zeros_like(cols[-1])]
+            e0 = lr(torch.cat(cols0, dim=1), pos, batch=batch, n_struct=2,
+                    l0_is_charge=True, les_dipole=dip, les_alpha=kind)
+            base = (torch.cat(cols[:-1], dim=1) if dip else q[:, None])
+            eb = lr(base, pos, batch=batch, n_struct=2, l0_is_charge=True,
+                    les_dipole=dip)
+            d0 = (e0 - eb).abs().max()
+            assert d0 < 1e-12, f"{kind}/dip={dip}: α=0 ≠ no-α: {d0:.3e}"
+            assert (e - e0).abs().max() > 1e-3, "α changed nothing"
+
+    # finite-difference forces (aniso + dipoles), independent of upstream
+    packed = torch.cat([q[:, None], u, a_ani.reshape(N, 9)], dim=1)
+    flags = dict(l0_is_charge=True, les_dipole=True, les_alpha='aniso')
+    p_a = pos.clone().requires_grad_(True)
+    grad = torch.autograd.grad(lr(packed, p_a, batch=batch, n_struct=2,
+                                  **flags).sum(), p_a)[0]
+    h = 1e-5
+    max_fd = 0.0
+    for (i, c) in [(0, 0), (3, 2), (7, 1)]:
+        es = []
+        for sgn in (+1, -1):
+            pp = pos.clone()
+            pp[i, c] += sgn * h
+            es.append(lr(packed, pp, batch=batch, n_struct=2, **flags).sum())
+        fd = (es[0] - es[1]) / (2 * h)
+        max_fd = max(max_fd, abs(float(fd - grad[i, c])))
+    assert max_fd < 1e-7, f"FD gradient mismatch with α: {max_fd:.2e}"
+
+    # periodic path: α passes straight through to upstream's Ewald
+    cell = (torch.eye(3, dtype=DTYPE) * 8.0).expand(2, 3, 3).contiguous()
+    e_p = lr(packed, pos, cell=cell, batch=batch, **flags)
+    res_p = lr.les(latent_charges=q, latent_dipoles=u, latent_alphas=a_ani,
+                   positions=pos, cell=cell, batch=batch)
+    dp = (e_p - res_p['E_lr']).abs().max()
+    assert dp < 1e-12, f"periodic α path != upstream: {dp:.3e}"
+
+    # born_charges: α=0 through upstream's forward equals the direct BEC
+    # module call (no-α path); α≠0 adds the induced dipoles and stays finite
+    # (latents must be functions of the positions, as they are through the
+    # model: upstream differentiates the polarization w.r.t. r)
+    n1 = sizes[0]
+    p1 = pos[:n1].clone().requires_grad_(True)
+    q1 = q[:n1] + 0.1 * p1.norm(dim=1)
+    u1 = u[:n1] + 0.05 * p1
+    a1 = a_ani[:n1] + 0.05 * p1[:, :, None] * p1[:, None, :]
+    l0_1 = torch.cat([q1[:, None], u1, a1.reshape(n1, 9)], dim=1)
+    Z_a = lr.born_charges(l0_1, p1, cell=None, **flags)
+    l0_0 = torch.cat([l0_1[:, :4], torch.zeros(n1, 9, dtype=DTYPE)], dim=1)
+    Z_0 = lr.born_charges(l0_0, p1, cell=None, **flags)
+    Z_ref = lr.born_charges(l0_1[:, :4], p1, cell=None, l0_is_charge=True,
+                            les_dipole=True)
+    dz0 = (Z_0 - Z_ref).abs().max()
+    assert Z_a.shape == (n1, 3, 3) and torch.isfinite(Z_a).all()
+    assert dz0 < 1e-12, f"born_charges α=0 != no-α path: {dz0:.3e}"
+    assert (Z_a - Z_0).abs().max() > 1e-6, "induced dipoles absent from Z*"
+
+    # total polarizability: per-structure sums, iso → multiple of identity
+    P = total_polarizability(a_ani, batch=batch, n_struct=2)
+    assert P.shape == (2, 3, 3)
+    assert (P[0] - a_ani[:n1].sum(0)).abs().max() < 1e-12
+    P_iso = total_polarizability(a_iso, batch=batch)
+    assert (P_iso[1] - a_iso[n1:].sum() * torch.eye(3, dtype=DTYPE)).abs().max() < 1e-12
+
+    try:
+        lr(packed, pos, batch=batch, n_struct=2, les_dipole=True,
+           les_alpha='aniso')
+        raise AssertionError("les_alpha without l0_is_charge should raise")
+    except ValueError as err:
+        assert 'l0_is_charge' in str(err)
+    print(f"  vectorized α path == upstream loop (worst {worst:.1e}); FD "
+          f"forces {max_fd:.1e}; periodic {dp:.1e}; born_charges α=0 "
+          f"{dz0:.1e}; polarizability sums OK; flag misuse rejected")
+
+
 def test_edge_readout_les_energy():
     """l0_is_charge=True: isolated fast path and upstream's latent_charges
     path agree, and the LES module holds no parameters (head bypassed)."""
@@ -681,6 +920,8 @@ if __name__ == "__main__":
     test_edge_dipole()
     test_dipoles_only()
     test_edge_dipole_les_energy()
+    test_edge_alpha()
+    test_edge_alpha_les_energy()
     test_edge_readout_les_energy()
     test_les_readout_validation()
     test_lazy_import()

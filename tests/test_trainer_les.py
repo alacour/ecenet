@@ -4,7 +4,7 @@ train_ecenet_mptrj (periodic).
 
 Requires the optional `les` package (skips cleanly when absent). Covers:
   1. rMD17 trainer: end-to-end use_les smoke on a synthetic npz ('sum' head
-     and parameter-free 'edge_basis'+dipole), checkpoint `les` key, and the
+     and parameter-free 'edge_basis'+dipole+iso-α), checkpoint `les` key, and the
      use_les resume-mismatch guard;
   2. MPtrj trainer: end-to-end use_les smoke (periodic Ewald, stress on),
      resume continues, mismatch guard;
@@ -73,8 +73,9 @@ def test_rmd17_use_les():
         common = dict(molecule='ethanol', data_dir=tmp, n_train=8, n_val=2,
                       n_test=2, n_epochs=2, batch_size=4, eval_every=1,
                       dtype=DTYPE, device=DEVICE, seed=0, verbose=False, **TINY)
-        for ro, dip in (('sum', False), ('edge_basis', True)):
+        for ro, dip, alp in (('sum', False, None), ('edge_basis', True, 'iso')):
             _, res = train_ecenet(use_les=True, les_readout=ro, les_dipole=dip,
+                                  les_alpha=alp,
                                   checkpoint_path=ckpt if ro == 'sum' else None,
                                   **common)
             assert np.isfinite(res['val_force_mae']), ro
@@ -91,7 +92,7 @@ def test_rmd17_use_les():
             raise AssertionError("use_les mismatch not caught")
         except ValueError as e:
             assert 'use_les' in str(e)
-    print("  smoke (sum, edge_basis+dipole), 'les' key, resume + guard OK\n")
+    print("  smoke (sum, edge_basis+dipole+α), 'les' key, resume + guard OK\n")
 
 
 def test_mptrj_use_les():

@@ -45,6 +45,11 @@ from ecenet.spherical import build_D1_from_rhat, build_D_block, spherical_harmon
 # head bypassed via l0_is_charge). The single definition — consumers read the
 # derived facts off the model via `les_flags` rather than re-spelling this.
 _LES_EDGE_MODES = ('edge', 'edge_basis')
+# les_alpha modes → width of the α slot in the packed l0 (1 scalar, or the
+# full 3×3 tensor flattened) and number of per-edge head scalars it needs
+# (a_e for the isotropic part; a_e + b_e for isotropic + bond-axial parts).
+_LES_ALPHA_WIDTH = {None: 0, 'iso': 1, 'aniso': 9}
+_LES_ALPHA_BLOCKS = {None: 0, 'iso': 1, 'aniso': 2}
 
 # ---------------------------------------------------------------------------
 # Main model
@@ -170,6 +175,7 @@ class ECENet(nn.Module):
         les_charge_scale: float = 1.0,
         les_dipole: bool = False,
         les_charges: bool = True,
+        les_alpha: str | None = None,
     ):
         super().__init__()
         if mp_type == 'transformer':
@@ -286,7 +292,42 @@ class ECENet(nn.Module):
                 "for the LES energy.")
         self.les_dipole = bool(les_dipole)
         self.les_charges = bool(les_charges)
-        self._l0_dim = (4 if les_dipole else 1) if _edge_mode else 2 * embed_dim
+        # les_alpha: the edge head also emits a per-atom latent polarizability
+        # α_i (Allegro-LES's construction; Kim, King, Park et al. 2026, arXiv
+        # 2605.05746) for upstream's induced-dipole term — each atom's dipole
+        # responds linearly to the field of the fixed multipoles, Δu_i = α_i·E_i,
+        # lowering the energy by ½E_i·α_i·E_i (non-self-consistent: induced
+        # dipoles don't see each other). Appended to the packed l0 after [q | u]:
+        #   'iso':   one scalar a_e per edge, scatter-summed → α_i (1 column)
+        #   'aniso': two scalars per edge, a_e·I + b_e·(r̂r̂ᵀ − I/3) — an
+        #            isotropic part plus a traceless bond-axial part, symmetric
+        #            and equivariant by construction (the Cartesian form of an
+        #            l=0 + l=2 edge harmonic; a lone bond gives exactly the
+        #            uniaxial α_∥/α_⊥ of a diatomic) — summed → α_i (9 columns,
+        #            the flattened 3×3)
+        # Head slots are zero-init: α ≡ 0 at init leaves an existing model
+        # untouched at step 0, and is NOT a saddle (E_lr is linear in α with
+        # gradient −½|E_i|², nonzero once charges exist). Unlike q, the sign of
+        # α is physical (E_lr is linear in it), and les_charge_scale does not
+        # touch it (a response coefficient, not a source). Physical α needs the
+        # ε_e unscaling of the paper's Eqs. 23–24 (ε_e = 1 in vacuum).
+        if les_alpha not in _LES_ALPHA_WIDTH:
+            raise ValueError("les_alpha must be None, 'iso' or 'aniso', "
+                             f"got {les_alpha!r}")
+        if les_alpha is not None and not _edge_mode:
+            raise ValueError(
+                f"les_alpha={les_alpha!r} requires les_readout='edge' or "
+                f"'edge_basis' (got {les_readout!r}): the polarizability is "
+                "emitted by the per-edge charge head, which the atomwise "
+                "read-outs don't have.")
+        self.les_alpha = les_alpha
+        self._n_alpha = _LES_ALPHA_WIDTH[les_alpha]
+        self._l0_dim = ((1 + (3 if les_dipole else 0) + self._n_alpha)
+                        if _edge_mode else 2 * embed_dim)
+        # head slot counts (q, d_e, α scalars): each slot is one n_output_out
+        # block of the 'edge_basis' MLP's last layer, or one 'edge' linear row
+        self._les_head_blocks = (int(les_charges), int(les_dipole),
+                                 _LES_ALPHA_BLOCKS[les_alpha])
         # les_charge_scale: fixed multiplier on the edge-mode latent charge
         # — the whole packed [q | u] when les_dipole is on, keeping the q–u
         # sign coupling intact (MACELES's output_scale; they ship 0.1). With standard head init,
@@ -312,12 +353,14 @@ class ECENet(nn.Module):
             nn.init.zeros_(self.les_score.weight)
             nn.init.zeros_(self.les_score.bias)
         elif les_readout == 'edge':
-            n_head_out = (2 if les_dipole else 1) if les_charges else 1
-            self.les_edge_charge = nn.Linear(2 * embed_dim, n_head_out,
+            n_q, n_u, n_a = self._les_head_blocks
+            self.les_edge_charge = nn.Linear(2 * embed_dim, n_q + n_u + n_a,
                                              bias=False)
-            if les_dipole and les_charges:
-                with torch.no_grad():
+            with torch.no_grad():
+                if les_dipole and les_charges:
                     self.les_edge_charge.weight[1].zero_()   # dipole slot
+                if n_a:
+                    self.les_edge_charge.weight[n_q + n_u:].zero_()   # α slots
             # les_charges=False: the single (standard-init) row IS the dipole
             # scalar — zero-init would sit on the uu-quadratic saddle (above)
         # (the 'edge_basis' head is built with the output MLP below)
@@ -448,15 +491,19 @@ class ECENet(nn.Module):
         # last layer widens to a second n_output_out block (dipole channels,
         # dotted with the same radial basis), zero-init per the note above.
         if les_readout == 'edge_basis':
-            n_blocks = (2 if les_dipole else 1) if les_charges else 1
-            q_dims = mlp_dims[:-1] + [n_output_out * n_blocks]
+            n_q, n_u, n_a = self._les_head_blocks
+            q_dims = mlp_dims[:-1] + [n_output_out * (n_q + n_u + n_a)]
             self.les_edge_charge = OutputMLP(q_dims, activation=act(),
                                              zero_init_last=False)
-            if les_dipole and les_charges:
-                with torch.no_grad():
-                    last = self.les_edge_charge.linears[-1]
-                    last.weight[n_output_out:].zero_()       # dipole block
-                    last.bias[n_output_out:].zero_()
+            with torch.no_grad():
+                last = self.les_edge_charge.linears[-1]
+                if les_dipole and les_charges:
+                    last.weight[n_output_out:2 * n_output_out].zero_()   # dipole
+                    last.bias[n_output_out:2 * n_output_out].zero_()
+                if n_a:                                       # α blocks
+                    k = (n_q + n_u) * n_output_out
+                    last.weight[k:].zero_()
+                    last.bias[k:].zero_()
             # les_charges=False: the single (standard-init) block IS the
             # dipole — see the saddle note at the les_charges check above
 
@@ -470,14 +517,16 @@ class ECENet(nn.Module):
     def les_flags(self):
         """The l0 convention as ``LESLongRange.forward`` kwargs.
 
-        ``{'l0_is_charge': ..., 'les_dipole': ...}`` — the single source of
-        truth for how this model's ``l0`` read-out is to be interpreted
-        (edge modes: l0 IS the charge, packed [q | u] under ``les_dipole``).
+        ``{'l0_is_charge': ..., 'les_dipole': ..., 'les_alpha': ...}`` — the
+        single source of truth for how this model's ``l0`` read-out is to be
+        interpreted (edge modes: l0 IS the charge, packed [q | u | α] under
+        ``les_dipole`` / ``les_alpha``; ``ecenet.les.unpack_l0`` splits it).
         Call sites do ``les_module(l0, pos, ..., **model.les_flags)`` instead
         of re-deriving the flags from hparams or ``les_readout`` literals.
         """
         return {'l0_is_charge': self.les_readout in _LES_EDGE_MODES,
-                'les_dipole': self.les_dipole}
+                'les_dipole': self.les_dipole,
+                'les_alpha': self.les_alpha}
 
     def _compute_ace_basis(self, pos_batch, nb_src, nb_dst, types, shift_vecs_nb=None):
         """Compute ACE atomic basis: (B, N, n_types, n_max, n_sph)."""
@@ -651,7 +700,9 @@ class ECENet(nn.Module):
         Returns:
             l0: (n_atoms, 2*embed_dim)     per-atom invariant scalar embeddings
                 — edge modes: (n_atoms, 1), the latent charge itself; with
-                les_dipole, packed (n_atoms, 4) = [q | u_x u_y u_z]
+                les_dipole, packed (n_atoms, 4) = [q | u_x u_y u_z]; with
+                les_alpha, a further 1 ('iso') or 9 ('aniso', flattened 3×3)
+                columns of latent polarizability (see __init__)
             l1: (n_atoms, 2*embed_dim, 3)  per-atom equivariant vector embeddings
 
         with_l1=False skips the l=1 Wigner rotation + scatter and returns
@@ -710,17 +761,30 @@ class ECENet(nn.Module):
                     out = out * env[:, None]
             else:
                 out = self.les_edge_charge(h_l0)               # (E, 1 | 2)
-            if self.les_dipole:
-                if self.les_charges:
-                    h_l0 = torch.cat([out[:, :1], out[:, 1:2] * r_hat], dim=1)
-                else:
-                    # dipoles-only: the head's single block is the dipole
-                    # scalar; the q column stays hard zero so the packed
-                    # [q | u] layout — and every consumer of it — is unchanged
-                    h_l0 = torch.cat([torch.zeros_like(out[:, :1]),
-                                      out[:, :1] * r_hat], dim=1)
+            # Pack the per-edge contributions as [q | d·r̂ | α] (see __init__).
+            # dipoles-only (les_charges=False): the q column stays hard zero
+            # so the packed layout — and every consumer of it — is unchanged.
+            k = 0
+            if self.les_charges:
+                cols = [out[:, :1]]
+                k = 1
             else:
-                h_l0 = out
+                cols = [torch.zeros_like(out[:, :1])]
+            if self.les_dipole:
+                cols.append(out[:, k:k + 1] * r_hat)
+                k += 1
+            if self.les_alpha == 'iso':
+                cols.append(out[:, k:k + 1])
+                k += 1
+            elif self.les_alpha == 'aniso':
+                # a_e·I + b_e·(r̂r̂ᵀ − I/3): isotropic + traceless bond-axial
+                eye = torch.eye(3, device=device, dtype=dtype)
+                tr0 = r_hat[:, :, None] * r_hat[:, None, :] - eye / 3.0
+                alpha_e = (out[:, k, None, None] * eye
+                           + out[:, k + 1, None, None] * tr0)   # (E, 3, 3)
+                cols.append(alpha_e.reshape(n_e, 9))
+                k += 2
+            h_l0 = cols[0] if len(cols) == 1 else torch.cat(cols, dim=1)
         elif self.les_readout == 'softmax':
             # Same shape as the MP layers' softmax path (one score slot):
             #   a_e = exp(s_e)·f_cut_e / (Σ_{e'→j} exp(s_e')·f_cut_e' + eps) · f_cut_e
@@ -750,7 +814,13 @@ class ECENet(nn.Module):
         # l1 keeps the plain unweighted sum)
         if (self.les_charge_scale != 1.0
                 and self.les_readout in _LES_EDGE_MODES):
-            l0 = l0 * self.les_charge_scale
+            if self._n_alpha:
+                # the α slot is a response coefficient, not a source: unscaled
+                n_qu = l0.shape[1] - self._n_alpha
+                l0 = torch.cat([l0[:, :n_qu] * self.les_charge_scale,
+                                l0[:, n_qu:]], dim=1)
+            else:
+                l0 = l0 * self.les_charge_scale
 
         if not with_l1:
             return l0, None
