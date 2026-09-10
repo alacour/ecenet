@@ -58,8 +58,6 @@ def predict_becs(checkpoint_path, xyz_files, device='cpu', max_frames=None):
     device = torch.device(device)
     model, les_module, hp, elem_to_type, dtype = load_les_model(
         checkpoint_path, device)
-    is_charge = model.les_flags['l0_is_charge']
-    les_dip = model.les_dipole
 
     records, skipped = [], {}
     for path in xyz_files:
@@ -88,17 +86,10 @@ def predict_becs(checkpoint_path, xyz_files, device='cpu', max_frames=None):
                                requires_grad=True)
             _, l0 = model.forward_pbc(pos, types, ei, ej, she, ni, nj, shn,
                                       return_embeddings=True, l0_only=True)
-            if is_charge:
-                q = l0[:, 0]
-                u = l0[:, 1:4] if les_dip else None
-            else:
-                q = les_module.les.atomwise(
-                    l0.reshape(l0.shape[0], -1),
-                    torch.zeros(len(symbols), dtype=torch.long, device=device))
-                u = None
-            bec = les_module.les.bec(q=q, r=pos, cell=None, u=u)
-            if bec.dim() == 4:          # (N, 2, 3, 3): charge + dipole parts
-                bec = bec.sum(dim=1)
+            # same implementation as ECENetLESCalculator.compute_bec (with
+            # les_alpha the induced dipoles are part of the polarization)
+            bec = les_module.born_charges(l0, pos, cell=None,
+                                          **model.les_flags)
             records.append({
                 'subset': subset, 'frame': fi, 'symbols': np.array(symbols),
                 'bec_pred': bec.detach().cpu().numpy(),

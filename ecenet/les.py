@@ -61,6 +61,57 @@ def _upstream_les():
     return Les
 
 
+def unpack_l0(l0, l0_is_charge=True, les_dipole=False, les_alpha=None):
+    """Split an edge-mode packed ``l0`` (N, 1 + 3·dipole + α) into (q, u, α).
+
+    The one place that knows the packed layout ``[q | u_xyz | α]`` the
+    model's edge head emits (see ``ECENet.__init__``); call with
+    ``**model.les_flags``. Returns q (N,), u (N, 3) or None, and α as (N,)
+    for ``'iso'``, (N, 3, 3) for ``'aniso'``, or None — the shapes upstream's
+    ``Les.forward`` takes for ``latent_dipoles`` / ``latent_alphas``.
+    """
+    if not l0_is_charge:
+        raise ValueError("unpack_l0 needs an edge-mode l0 (l0_is_charge=True); "
+                         "atomwise read-outs carry a descriptor, not [q | u | α]")
+    n = l0.shape[0]
+    q = l0[:, 0]
+    k = 1
+    u = None
+    if les_dipole:
+        u = l0[:, 1:4]
+        k = 4
+    alpha = None
+    if les_alpha == 'iso':
+        alpha = l0[:, k]
+    elif les_alpha == 'aniso':
+        alpha = l0[:, k:k + 9].reshape(n, 3, 3)
+    elif les_alpha is not None:
+        raise ValueError(f"unknown les_alpha {les_alpha!r}")
+    return q, u, alpha
+
+
+def total_polarizability(alpha, batch=None, n_struct=None):
+    """Per-structure polarizability tensor Σ_i α_i, (B, 3, 3).
+
+    The model's induced dipoles respond linearly and non-self-consistently
+    to the field, and the fixed multipoles don't respond at all, so the
+    polarization response to a uniform external field is exactly the sum
+    of the atomic tensors (paper Eq. 29) — no autograd needed. An isotropic
+    α (N,) is broadcast to α·I. This is the *latent* α^les; the physical
+    tensor is ε_e·α^les with ε_e = 1 in vacuum (isolated molecules) and
+    ε_e = ε_∞/(1 + χ^les) for bulk (paper Eqs. 23–24).
+    """
+    if alpha.dim() == 1:
+        eye = torch.eye(3, device=alpha.device, dtype=alpha.dtype)
+        alpha = alpha[:, None, None] * eye
+    if batch is None:
+        return alpha.sum(dim=0, keepdim=True)
+    if n_struct is None:
+        n_struct = int(batch.max().item()) + 1
+    out = torch.zeros(n_struct, 3, 3, device=alpha.device, dtype=alpha.dtype)
+    return out.index_add_(0, batch, alpha)
+
+
 class LESLongRange(nn.Module):
     """Long-range electrostatic energy from per-atom invariant embeddings.
 
@@ -95,7 +146,8 @@ class LESLongRange(nn.Module):
                 return_charges: bool = False,
                 n_struct: int | None = None,
                 l0_is_charge: bool = False,
-                les_dipole: bool = False):
+                les_dipole: bool = False,
+                les_alpha: str | None = None):
         """Long-range energy for one structure or a packed batch.
 
         l0        (N, C)   per-atom invariant descriptor (any flattenable
@@ -106,7 +158,12 @@ class LESLongRange(nn.Module):
                   module holds no parameters. With ``les_dipole=True``
                   (requires ``l0_is_charge``), l0 is the model's packed
                   (N, 4) = [q | u] and the latent atomic dipoles u are passed
-                  to upstream's charge–dipole/dipole–dipole terms.
+                  to upstream's charge–dipole/dipole–dipole terms. With
+                  ``les_alpha`` ('iso' / 'aniso', requires ``l0_is_charge``)
+                  the packed l0 also carries the latent polarizability α
+                  (see ``unpack_l0``), passed to upstream's induced-dipole
+                  term −½ E_i·α_i·E_i (E_i the field of the fixed
+                  multipoles at atom i).
         positions (N, 3)   in Å, on the same autograd graph as the SR energy
         cell      (B, 3, 3) or (3, 3); None → isolated / non-periodic, served
                   by the vectorized batched path below (verified equal to
@@ -120,20 +177,24 @@ class LESLongRange(nn.Module):
         ``return_charges=True``, also the per-atom latent charges — the q
         column only under ``les_dipole``; take u from l0 directly).
         """
-        if les_dipole and not l0_is_charge:
-            raise ValueError("les_dipole=True requires l0_is_charge=True "
-                             "(the packed [q | u] comes from the model's "
+        if (les_dipole or les_alpha) and not l0_is_charge:
+            raise ValueError("les_dipole / les_alpha require l0_is_charge=True "
+                             "(the packed [q | u | α] comes from the model's "
                              "edge head).")
         if batch is None:
             batch = torch.zeros(positions.shape[0], dtype=torch.long,
                                 device=positions.device)
             if n_struct is None:
                 n_struct = 1
-        # unpack once; the branches below carry u alongside the charges
-        q, u = (l0[:, 0], l0[:, 1:4]) if les_dipole else (l0, None)
+        # unpack once; the branches below carry u and α alongside the charges
+        if les_dipole or les_alpha:
+            q, u, alpha = unpack_l0(l0, True, les_dipole, les_alpha)
+        else:
+            q, u, alpha = l0, None, None
         if cell is None:
             return self._isolated_batched(q, positions, batch, n_struct,
-                                          return_charges, l0_is_charge, u=u)
+                                          return_charges, l0_is_charge,
+                                          u=u, alpha=alpha)
         # Scope the default dtype to the input's so upstream's lazily built
         # charge MLP (and any default-dtype internals) match float64 inputs.
         prev_dtype = torch.get_default_dtype()
@@ -143,6 +204,7 @@ class LESLongRange(nn.Module):
                 result = self.les(
                     latent_charges=q.reshape(-1),
                     latent_dipoles=u,
+                    latent_alphas=alpha,
                     positions=positions,
                     cell=cell.view(-1, 3, 3),
                     batch=batch,
@@ -165,7 +227,7 @@ class LESLongRange(nn.Module):
         return result["E_lr"]
 
     def _isolated_batched(self, l0, positions, batch, n_struct, return_charges,
-                          l0_is_charge=False, u=None):
+                          l0_is_charge=False, u=None, alpha=None):
         """Isolated (non-periodic) long-range energy, vectorized over the batch.
 
         Upstream's ``Les.forward`` loops over structures in Python — masked
@@ -185,9 +247,15 @@ class LESLongRange(nn.Module):
             E_b = ½ qᵀf_qq q + (u·f_qu)ᵀq − ½ uᵀf_uu u   (i,j ∈ b)
 
         (the qu coefficient is 1, not ½, and the self-interaction is removed
-        by ``make_kernels`` — both upstream's conventions). Verified equal to
+        by ``make_kernels`` — both upstream's conventions). With latent
+        polarizabilities ``alpha`` ((N,) isotropic or (N, 3, 3)) the field
+        of the fixed multipoles at each atom is formed from the same masked
+        kernels, E_j = Σ_i q_i f_qu[i,j] + Σ_i u_i·f_uu[i,j], and the
+        induced-dipole energy −½ Σ_j E_j·α_j·E_j is added, mirroring
+        upstream's ``_get_induced_u`` (non-self-consistent: the field
+        excludes the induced dipoles themselves). Verified equal to
         upstream's loop (energies, charges, and position gradients) in
-        tests/test_les.py, charge-only and with dipoles.
+        tests/test_les.py, charge-only, with dipoles, and with alphas.
 
         Tradeoff: the dense kernel spans ALL atom pairs, so this does
         (ΣN)² pair work where the loop does Σ(N_b²) — ~batch_size× redundant
@@ -237,7 +305,8 @@ class LESLongRange(nn.Module):
         ew = self.les.ewald
         f_qq, f_qu, f_uu, _, _ = make_kernels(positions + shift, ew.sigma,
                                               ew.norm_factor / ew.twopi,
-                                              compute_u=u is not None,
+                                              compute_u=(u is not None
+                                                         or alpha is not None),
                                               compute_Q=False)
         same = (batch.unsqueeze(0) == batch.unsqueeze(1)).to(f_qq.dtype)
         e_phi = torch.einsum('iq,ij->jq', q, f_qq * same)
@@ -255,12 +324,65 @@ class LESLongRange(nn.Module):
             G = torch.einsum('ic,ijcd->ijd', u_, f_uu)              # (N, N, 3)
             T = torch.einsum('ijd,jd->ij', G, u_)
             per_atom = per_atom - 0.5 * (T * same).sum(dim=0)
+        if alpha is not None:
+            # field of the fixed multipoles at j (upstream's e_field: charges
+            # via f_qu, dipoles via f_uu — the latter is G above), masked to
+            # the structure; then Δu_j = α_j·E_j and U^iu_j = −½ E_j·Δu_j
+            e_field = (q[:, :, None] * f_qu * same[:, :, None]).sum(dim=0)
+            if u is not None:
+                e_field = e_field + (G * same[:, :, None]).sum(dim=0)
+            alpha_ = alpha.to(positions.dtype)
+            if alpha_.dim() == 1:
+                u_ind = e_field * alpha_[:, None]
+            else:
+                u_ind = torch.einsum('jc,jcd->jd', e_field, alpha_)
+            per_atom = per_atom - 0.5 * (e_field * u_ind).sum(dim=-1)
         e_lr = torch.zeros(n_struct, dtype=per_atom.dtype,
                            device=per_atom.device
                            ).scatter_add(0, batch, per_atom)
         if return_charges:
             return e_lr, charges
         return e_lr
+
+    def born_charges(self, l0, positions, cell=None, l0_is_charge=False,
+                     les_dipole=False, les_alpha=None):
+        """Born effective charges Z* = ∂P/∂r for ONE structure, (N, 3, 3).
+
+        ``positions`` must be on the autograd graph that produced ``l0``, so
+        the latent variables stay functions of the positions and upstream's
+        BEC module delivers the charge-flow terms. Upstream handles the
+        polarization (Berry-phase-style for a periodic ``cell``, direct sum
+        for ``None``), mean-charge removal, and the √ε∞ normalisation from
+        ``les_arguments``; charge and dipole parts are summed. With
+        ``les_alpha`` the induced dipoles Δu_i = α_i·E_i are part of the
+        polarization, so the call goes through upstream's full forward (one
+        extra field evaluation); otherwise straight to the BEC module. The
+        single implementation behind the calculator and the eval tools.
+        """
+        prev_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(positions.dtype)
+        try:
+            cell_t = None if cell is None else cell.view(-1, 3, 3)
+            if l0_is_charge:
+                q, u, alpha = unpack_l0(l0, True, les_dipole, les_alpha)
+                if alpha is not None:
+                    res = self.les(latent_charges=q, latent_dipoles=u,
+                                   latent_alphas=alpha, positions=positions,
+                                   cell=cell_t, compute_energy=True,
+                                   compute_bec=True)
+                    bec = res['BEC']
+                else:
+                    bec = self.les.bec(q=q, r=positions, cell=cell_t, u=u)
+            else:
+                batch = torch.zeros(l0.shape[0], dtype=torch.long,
+                                    device=l0.device)
+                q = self.les.atomwise(l0.reshape(l0.shape[0], -1), batch)
+                bec = self.les.bec(q=q, r=positions, cell=cell_t)
+        finally:
+            torch.set_default_dtype(prev_dtype)
+        if bec.dim() == 4:              # (N, 2, 3, 3): charge + dipole parts
+            bec = bec.sum(dim=1)
+        return bec
 
 
 def load_les_module(ckpt_les, model, device, dtype, load_state=True):

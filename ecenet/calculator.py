@@ -505,8 +505,9 @@ class ECENetLESCalculator(ECENetCalculator):
     ECENetCalculator refusing LES ones). The upstream charge head is
     materialised and its trained state loaded here; edge-mode read-outs
     (``les_readout='edge'/'edge_basis'``) carry the charge (and with
-    ``les_dipole`` the bond dipoles) inside the model itself, so the LES
-    module is then parameter-free.
+    ``les_dipole`` the bond dipoles, with ``les_alpha`` the latent
+    polarizabilities) inside the model itself, so the LES module is then
+    parameter-free.
     """
 
     _uses_cell = True
@@ -552,10 +553,12 @@ class ECENetLESCalculator(ECENetCalculator):
     # ── Energy seams: add E_lr on the same graph ────────────────────────────
     #
     # Both seams also stash the per-atom latent charges (and, with
-    # ``les_dipole``, the latent atomic dipoles) into ``self.results`` as a
-    # side effect — every force call computes them anyway, so exposing them
-    # is free. ``atoms.get_charges()`` reads ``results['charges']`` (e);
-    # ``results['les_dipoles']`` holds u (N, 3) in e·Å. Stashing is safe in
+    # ``les_dipole`` / ``les_alpha``, the latent atomic dipoles and
+    # polarizabilities) into ``self.results`` as a side effect — every force
+    # call computes them anyway, so exposing them is free.
+    # ``atoms.get_charges()`` reads ``results['charges']`` (e);
+    # ``results['les_dipoles']`` holds u (N, 3) in e·Å; ``results['les_alphas']``
+    # holds α^les as (N,) or (N, 3, 3) in e·Å/(V/Å). Stashing is safe in
     # the strain (stress) pass too: it evaluates at ε = 0, i.e. the
     # unstrained geometry, so it stores the same numbers. The global sign of
     # the latent charges is arbitrary (E_lr is quadratic in q) — consistent
@@ -563,8 +566,13 @@ class ECENetLESCalculator(ECENetCalculator):
 
     def _stash_charges(self, q, l0):
         self.results['charges'] = q.detach().cpu().numpy().reshape(-1)
-        if self.model.les_dipole:
-            self.results['les_dipoles'] = l0[:, 1:4].detach().cpu().numpy()
+        if self.model.les_dipole or self.model.les_alpha:
+            from ecenet.les import unpack_l0
+            _, u, alpha = unpack_l0(l0, **self.les_flags)
+            if u is not None:
+                self.results['les_dipoles'] = u.detach().cpu().numpy()
+            if alpha is not None:
+                self.results['les_alphas'] = alpha.detach().cpu().numpy()
 
     def _energy_free(self, pos, types):
         e_sr, l0 = self.model.forward(pos, types, return_embeddings=True,
@@ -595,7 +603,9 @@ class ECENetLESCalculator(ECENetCalculator):
         (Berry-phase-style for periodic cells, direct sum otherwise),
         mean-charge removal, and the √ε∞ normalisation as configured in the
         checkpoint's ``les_arguments``; with ``les_dipole`` the charge and
-        dipole parts are summed.
+        dipole parts are summed, and with ``les_alpha`` the induced dipoles
+        Δu_i = α_i·E_i are part of the polarization (see
+        ``LESLongRange.born_charges``).
 
         Unlike the latent-charge stash this cannot ride along ``calculate()``
         — the force backward frees the graph, and Z* needs gradients of the
@@ -623,20 +633,47 @@ class ECENetLESCalculator(ECENetCalculator):
                 _, l0 = self.model.forward(pos, types, return_embeddings=True,
                                            l0_only=True)
                 cell_t = None
-            if self.les_flags['l0_is_charge']:
-                q = l0[:, 0]
-                u = l0[:, 1:4] if self.les_flags['les_dipole'] else None
-            else:
-                # upstream's atomwise head maps the l0 descriptor to charges
-                q = self.les_module.les.atomwise(
-                    l0.reshape(l0.shape[0], -1),
-                    torch.zeros(len(symbols), dtype=torch.long,
-                                device=self.device))
-                u = None
-            bec = self.les_module.les.bec(q=q, r=pos, cell=cell_t, u=u)
-        if bec.dim() == 4:              # (N, 2, 3, 3): charge + dipole parts
-            bec = bec.sum(dim=1)
+            bec = self.les_module.born_charges(l0, pos, cell=cell_t,
+                                               **self.les_flags)
         return bec.detach().cpu().numpy()
+
+    def compute_polarizability(self, atoms):
+        """Polarizability tensor α = Σ_i α_i for one structure, (3, 3).
+
+        Needs a ``les_alpha`` checkpoint. The induced dipoles respond
+        linearly and non-self-consistently to the field, and the fixed
+        multipoles don't respond to an external field at all, so the
+        polarization response is exactly the sum of the atomic tensors
+        (paper Eq. 29) — one forward, no gradients. An isotropic ``'iso'``
+        model gives a multiple of the identity. Units e·Å/(V/Å) = e·Å²/V
+        (multiply by 1/(4πε₀) = 14.3996 eV·Å/e² for Å³). This is the latent
+        α^les: physical for an isolated molecule (ε_e = 1); for bulk it needs
+        the ε_e = ε_∞/(1 + χ^les) unscaling of the paper's Eqs. 23–24, which
+        needs ε_∞ and is left to the caller. Unlike the latent charges the
+        sign is physical: E_lr is linear in α.
+        """
+        if self.model.les_alpha is None:
+            raise ValueError("compute_polarizability needs a checkpoint "
+                             "trained with les_alpha ('iso' or 'aniso')")
+        from ecenet.les import total_polarizability, unpack_l0
+        symbols = atoms.get_chemical_symbols()
+        types = self._types(symbols)
+        pos = torch.tensor(atoms.get_positions(), dtype=self.dtype,
+                           device=self.device)
+        with torch.no_grad():
+            if atoms.pbc.any():
+                cell_np = atoms.get_cell().array
+                (edge_i, edge_j, she,
+                 nb_src, nb_dst, shn) = self._neighbor_lists(pos, cell_np)
+                _, l0 = self.model.forward_pbc(
+                    pos, types, edge_i, edge_j, she, nb_src, nb_dst, shn,
+                    return_embeddings=True, l0_only=True)
+            else:
+                _, l0 = self.model.forward(pos, types, return_embeddings=True,
+                                           l0_only=True)
+            _, _, alpha = unpack_l0(l0, **self.les_flags)
+            pol = total_polarizability(alpha)[0]
+        return pol.cpu().numpy()
 
 
 def load_calculator(checkpoint_path, verbose=True, **kwargs):

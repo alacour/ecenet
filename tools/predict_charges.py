@@ -103,8 +103,13 @@ def _predict_frame(model, les_module, hp, elem_to_type, dtype, atoms, device):
         'charges': q.cpu().numpy().reshape(-1),
         'e_lr': float(e_lr.sum()),
     }
-    if model.les_dipole:
-        out['dipoles'] = l0[:, 1:4].cpu().numpy()
+    if model.les_dipole or model.les_alpha:
+        from ecenet.les import unpack_l0
+        _, u, alpha = unpack_l0(l0, **model.les_flags)
+        if u is not None:
+            out['dipoles'] = u.cpu().numpy()
+        if alpha is not None:          # (N,) 'iso' or (N, 3, 3) 'aniso'
+            out['alphas'] = alpha.cpu().numpy()
     if 'q' in atoms.arrays:
         out['charges_ref'] = np.asarray(atoms.arrays['q'], dtype=np.float64)
     return out

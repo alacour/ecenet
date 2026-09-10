@@ -710,6 +710,7 @@ def train_ecenet_mptrj(
     les_charge_scale=1.0,  # fixed multiplier on the edge-mode latent charge (MACELES: 0.1)
     les_dipole=False,      # edge head also emits bond dipoles; l0 packed [q | u]
     les_charges=True,      # False (needs les_dipole): dipoles-only — q hard zero, standard-init dipole head
+    les_alpha=None,        # None | 'iso' | 'aniso': edge head also emits polarizabilities α (induced dipoles)
     # Joint LES long-range training: E = E_sr + E_lr on one autograd graph.
     # Periodic structures use upstream's reciprocal-space Ewald, so every
     # frame needs its cell tensor — prepared shards written before cells were
@@ -993,6 +994,7 @@ def train_ecenet_mptrj(
         les_charge_scale=les_charge_scale,
         les_dipole=les_dipole,
         les_charges=les_charges,
+        les_alpha=les_alpha,
     )
     if dtype == torch.float64:
         model = model.double()
@@ -1161,6 +1163,7 @@ def train_ecenet_mptrj(
                 les_charge_scale=les_charge_scale,
                 les_dipole=les_dipole,
                 les_charges=les_charges,
+                les_alpha=les_alpha,
             ),
             'element_to_type': elements.to_element_to_type(type_map),  # {symbol: type_idx}
             'e_ref': e_ref,             # per-element reference energies (eV)

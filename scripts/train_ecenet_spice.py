@@ -344,6 +344,7 @@ def train_ecenet_spice(
     les_charge_scale=1.0,  # fixed multiplier on the edge-mode latent charge (MACELES: 0.1)
     les_dipole=False,      # edge head also emits bond dipoles; l0 packed [q | u]
     les_charges=True,      # False (needs les_dipole): dipoles-only — q hard zero, standard-init dipole head
+    les_alpha=None,        # None | 'iso' | 'aniso': edge head also emits polarizabilities α (induced dipoles)
     # Long-range (LES): E = E_sr + E_lr on one autograd graph. Needs the
     # optional `les` package (see ecenet/les.py for install + licensing).
     use_les=False,
@@ -510,6 +511,7 @@ def train_ecenet_spice(
         les_charge_scale=les_charge_scale,
         les_dipole=les_dipole,
         les_charges=les_charges,
+        les_alpha=les_alpha,
     )
     if dtype == torch.float64:
         model = model.double()
@@ -717,6 +719,7 @@ def train_ecenet_spice(
                 les_charge_scale=les_charge_scale,
                 les_dipole=les_dipole,
                 les_charges=les_charges,
+                les_alpha=les_alpha,
             ),
             'e_ref': e_ref,  # per-element reference energies (eV/atom)
             # Self-describing metadata for the calculator (no dataset coupling).
